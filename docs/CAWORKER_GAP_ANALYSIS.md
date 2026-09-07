@@ -1,14 +1,30 @@
-# CAworker Gap Analysis — Phase 0
+# CAworker Gap Analysis — Phase 0（Tenon 仓库复审）
 
 ## 审计范围与结论
 
-本次仅执行 Repository Audit / Architecture Mapping，不实施 Phase 1，不修改源码、测试、配置或现有文档。审计依据是当前仓库实现及用户提供的改造计划；没有把 X-Code CLI / Hello-Agent 的实现视为已经核实的事实，也没有复制其代码。
+本次更新已有 Repository Audit / Architecture Mapping，仅修改本报告，不实施 Phase 1，不修改源码、测试或配置。审计依据是当前仓库实现及用户提供的改造计划；没有把 X-Code CLI / Hello-Agent 的实现视为已经核实的事实，也没有复制其代码。
 
-- 仓库：`D:\26软院预推免项目\agent`，产品名 CAworker，兼容包名与命令仍为 `rivet`。
-- 审计基线：`18068e2883e51436abd005533fc6b39fd6a8af8a`，版本 `1.9.0`。
-- 审计开始及暂停后续查时，Git 工作区均干净，源码哈希一致。
-- 范围覆盖目录清单、20 个 Python 模块的结构与关键实现、Web 前端调用链、内置 Skill、项目文档和 CI。`build/` 是生成副本，不作为实现依据；`.env` 与本地会话内容未读取。
+- 复审日期：2026-09-07。
+- 仓库：`D:\github_projects\Tenon`；README 中产品名仍为 CAworker，包名为 `rivet-code-agent`，Python 包和命令仍为 `rivet`。目录迁移不等于已经完成产品改名。
+- 当前审计基线：`10b44e7cabfe2ee763f8facd25117bbb5ba44a7f`（`chore: initialize Tenon from CAworker`），版本仍为 `1.9.0`。
+- 审计开始时 Git 工作区干净；本次交付只更新本报告。
+- 范围覆盖当前目录清单、20 个 Python 模块的结构与关键实现、Web/Core 接口、Skill、项目文档和 CI；未读取真实凭据或本地会话，未调用真实模型。
 - 下文“已复现”指无网络、无文件修改的内存模拟或只读调用；“静态确认”指实现直接支持结论；“待验证”指尚未做平台或真实服务实验。存在实现不等于已经通过完整验收。
+
+### 相对上一版的更新
+
+| 项目 | 旧报告 | 本次复审 |
+| --- | --- | --- |
+| 仓库与历史 | 旧目录 `agent`，提交 `18068e2…` | 当前为 Tenon，Git 仅有初始化提交 `10b44e7…` |
+| 历史可比性 | 记录了旧提交与源码哈希 | 当前 Git 不含旧提交对象，无法做可靠的跨版本 Git diff；不能仅凭行数相同断言源码逐字节未变 |
+| Runtime 能力 | Registry、Plan、Session、Context、子 Agent 已存在 | 重新检查对应实现，仍可复用；本次未发现足以将 Phase 1 标记为完成的证据 |
+| G01/G02 | 工具结果悬空、模型异常与压缩取消逃出 Core | 重新运行旧报告脚本，全部仍可复现 |
+| 事件异常 | 主要依据静态分析 | 新增内存复现：首个 `tool_end` 回调抛错后第二个 call 无结果，`last_result=None` |
+| Loop/预算/验证/脱敏 | 已有缺口证据 | 重新复现 A/B 循环、耗时干扰签名、单条输入超预算、跟踪不完整仍验证通过、事件流保留合成 secret |
+| 本地目录 | 列出空 tests、examples、运行数据和 build | 当前检出中不存在这些目录，目录图已修正；仍无正式 tests 测试集 |
+| 下一步 | Phase 1-A 边界建议 | 补充拆分顺序、设计约束、测试矩阵和可直接使用的下一轮任务说明 |
+
+因此，本次主要是**迁移后重新建立可信审计基线，并确认缺口仍在**，不能把旧报告的全部结论直接视为新版本验证结果，也不能据仓库更新推断功能已补齐。本文保留 G01–G10 编号，便于后续修复引用。
 
 **总体结论：CAworker 已经具备一套可演进的 Coding Agent Runtime，不能按“只有最小循环、其余都缺失”来重建。** Tool Registry、参数验证、结构化错误、PlanState、Session / Resume、ContextManager、三层 Skill、只读子 Agent 与线程池都已有实现。主要差距是停止路径的一致性、工具调用协议完整性、长任务预算和持久化边界，以及缺少系统性的行为回归测试。
 
@@ -19,12 +35,13 @@
 ### 1. 目录与模块职责
 
 ```text
-agent/
+Tenon/
 ├── pyproject.toml                Python >= 3.10；无运行时第三方依赖
 ├── README.md / README.txt
 ├── docs/
 │   ├── ARCHITECTURE.md
-│   └── PROVIDERS.md
+│   ├── PROVIDERS.md
+│   └── CAWORKER_GAP_ANALYSIS.md   本报告
 ├── src/rivet/
 │   ├── __main__.py / cli.py      CLI 入口、TUI 会话调度
 │   ├── agent.py                  主循环、任务证据、运行态与恢复
@@ -42,12 +59,10 @@ agent/
 │   ├── builtin_skills/           bug-diagnosis、python-testing 及参考资料
 │   ├── tui.py                    终端输入、事件显示与审批
 │   └── web.py / webui/           本地 HTTP 服务、HTML/CSS/原生 JavaScript
-├── .github/workflows/ci-cd.yml   编译、资源/打包检查与上下文 smoke
-├── tests/                       当前为空，Git 中没有测试文件
-├── examples/demo_project/       当前仅见本地会话目录，无可复用示例源码
-├── .rivet/sessions/              本地运行数据；不作为审计输入
-└── build/                       本地生成产物
+└── .github/workflows/ci-cd.yml   编译、资源/打包检查与上下文 smoke
 ```
+
+当前检出没有 `tests/`、`examples/`、`build/` 或 `.rivet/`；后者是运行时可创建的数据目录。未找到适用于本仓库的 `AGENTS.md`。CI 中已有内嵌的上下文 smoke 脚本，因此“无正式测试目录”不等于“完全没有验证”。
 
 `pyproject.toml` 将命令映射为 `rivet.cli:main`。模块规模提示后续拆分边界：`agent.py` 1,231 行、`workspace.py` 1,427 行、`tools.py` 621 行、`web.py` 809 行、`tui.py` 951 行、`webui/app.js` 2,105 行。行数本身不是缺陷；主要问题是生命周期和业务规则分布在不同层。
 
@@ -175,7 +190,7 @@ Explore 和 Review 使用相同只读白名单，只在提示词职责上区分�
 - `cli.py:212` 在 `agent.run()` 成功返回后才保存。ModelError 进入 `main()` 外层错误处理并退出，失败轮次不会走正常保存。
 - `web.py:156` 则调用 `record_failure()` 后保存，同一失败在两种界面中行为不同。
 - `agent.py:636` 的 `context.compact()` 位于上述取消处理之外。模拟 summarizer 抛 OperationCancelled 时，异常逃出 `run()`，没有规范 cancelled result。
-- 事件回调及审批回调也不都位于工具 handler 的保护边界内。回调异常可能中断记录过程；此项属于静态确认的边界缺口，未模拟全部回调组合。
+- 事件回调及审批回调也不都位于工具 handler 的保护边界内。本次新增复现：同一响应含 `a/b` 两个 read_file 调用，首个 `tool_end` 回调抛 RuntimeError 后异常逃出 Core，`b` 没有 observation，`last_result=None`。审批及其他回调组合仍未逐一模拟。
 
 **建议：** 将压缩、模型、工具、observation 和收尾纳入一致的 turn/step 错误边界；所有受控停止都形成 AgentResult，准确保留实际完成步数，TUI/Web 共享失败语义。UI 事件失败不应破坏工具协议和任务状态。
 
@@ -321,7 +336,8 @@ Explore 和 Review 使用相同只读白名单，只在提示词职责上区分�
 6. **持久化不是单一事实日志。** conversation view、archive、transcript、task evidence、last_result 存在交叉信息；序列化/恢复变更需要版本与兼容测试。接口尚未体现 running/pending/finished 工具事务。
 7. **只读与所有用户操作不是同一权限边界。** Web 的 undo/revert 是明确用户触发的管理操作，直接调用 Workspace，没有走 ToolRegistry。不能把这个设计直接标为模型权限绕过，但未来 Plan Mode 必须明确是否也约束这些 UI 操作。
 8. **文档存在超出实现的表述。** ARCHITECTURE 的子报告描述含 command/changed/verification 等证据，实际 report evidence 只有 inspected_files；“不会向浏览器序列化凭据”没有覆盖原始事件流。Provider 文档仍称 Version 1.5，client User-Agent 为 1.7，而包版本为 1.9.0。需在对应实现修复后同步文档。
-9. **回归测试是最大交付证据缺口。** tests 目录为空。CI 已有源码编译、CLI help、资源、JS syntax、打包检查和 context smoke，不能据此声称“没有任何测试”，也不能据此声称 loop/permission/session/concurrency 已验证。
+9. **回归测试是最大交付证据缺口。** 当前没有 tests 目录或正式行为测试集。CI 已有源码编译、CLI help、资源、JS syntax、打包检查和 context smoke，不能据此声称“没有任何测试”，也不能据此声称 loop/permission/session/concurrency 已验证。
+10. **仓库迁移后的标识尚未同步。** README 的 clone、徽章链接仍指向 `STL250/agent`，目录示例也仍称 agent。是否改名为 Tenon 应由产品目标决定；当前无需为修可靠性而批量改包名或 `.rivet` 数据目录。Session 的工作区路径指纹意味着旧目录的会话不能默认直接搬到新目录恢复，后续迁移须单独设计，不能直接移除校验。
 
 ## Recommended Refactoring Order
 
@@ -329,7 +345,7 @@ Explore 和 Review 使用相同只读白名单，只在提示词职责上区分�
 
 | 阶段 | 复用基础与建议工作 | 阶段验收重点 |
 | --- | --- | --- |
-| Phase 0 | 完成本报告、架构映射、复现证据与能力对照 | 仅新增报告；源码不变 |
+| Phase 0 | 更新本报告、架构映射、复现证据与能力对照 | 仅更新报告；源码不变 |
 | Phase 1 | 先修 G01/G02，再统一 ToolOutcome、Guard、完成证据；对现有输出补脱敏回归 | 所有受控停止无悬空调用；TUI/Web/Core 失败一致；可自纠正；识别重复与无进展；验证结果语义准确 |
 | Phase 2 | 在 PlanState 上扩展 Todo；将 scope/mutating/mode/operation/resource 汇聚为 PolicyEngine；建立 Plan→审批→Execute | 普通/失败/边界权限矩阵；读模式任何模型路径均不能写；计划批准有版本关联 |
 | Phase 3 | 保留 SessionStore JSON，补 checkpoint、running/pending 状态与恢复策略 | 重启恢复 conversation/plan/evidence；损坏会话可诊断；结果未知的写操作不自动重放；兼容旧会话 |
@@ -352,11 +368,60 @@ Explore 和 Review 使用相同只读白名单，只在提示词职责上区分�
 
 这里仅提出下一步边界，**本次没有开始 Phase 1-A 编码**。
 
+### Phase 1 的具体拆分与首项设计约束
+
+| 顺序 | 任务 | 最小交付 | 完成条件 |
+| --- | --- | --- | --- |
+| 1-A | G01/G02：工具协议和 turn 收尾 | 在现有 Agent 内集中结算；统一受控失败/取消；TUI/Web 保存行为对齐；离线回归 | 下表中的正常、失败、边界场景通过，已有 context smoke 不回退 |
+| 1-B | G04：ToolOutcome 与错误分类 | 复用 ToolSpec/Registry，明确 schema 错误、执行失败、拒绝、超时、取消及执行状态 | 失败 observation 可自纠正；不会把 shell 失败当工具业务成功；旧字段调用方有兼容处理 |
+| 1-C | G03：Loop Guard 与预算 | 分离调用、观察和进展信号；过滤耗时字段；增加窗口检测及调用数/时间预算 | 重复错误及 A/B 循环可停；有新信息的读取不误停；所有停止复用 1-A 的结算 |
+| 1-D | Phase 1 回归收口 | 明确验证证据等级；对已有 Web 输出脱敏补修复与回归 | tracking limited 有明确语义；合成 secret 不经应脱敏的输出通道泄露；无跨层结果不一致 |
+
+1-A 可以拆成“先工具批次结算，后统一异常收尾”两个小提交，每个提交单独验证。1-B 修改结果协议时必须同步 TaskState、Context fallback、TUI/Web 的现有解析；不必为此先重写全部工具。
+
+**1-A 的设计必须先确定以下不变量：**
+
+1. 每个已接受的 assistant tool-call 批次，在继续模型请求或保存可恢复状态前，每个 call ID 恰好有一个对应结果。模型返回重复 ID、孤立 tool result 等非法协议必须有明确拒绝路径。
+2. 结算不等于执行：guard/取消之后的未执行调用只补 `skipped` 观察，不能真的执行剩余写操作，也不能把未执行调用计作读文件、修改或验证证据。
+3. 工具已经成功执行但事件显示失败时，保留真实结果；不能为修补历史再次运行该工具。执行是否发生无法确认时标记为结果未知，并阻止自动重放副作用。
+4. 压缩、模型、工具、审批和收尾中的受控失败形成一次终态结果；`last_result`、steps/total_steps 口径明确且不重复累加，运行锁得到释放。并发重复调用 `run()` 等调用方误用不应被吞成普通成功结果。
+5. UI 事件失败与工具失败要分开记录；停止、失败、保存和后续继续在 Core/TUI/Web 中语义一致。原有 `reason`、事件及会话格式优先兼容。
+6. 旧会话若已含不完整调用，恢复时明确拒绝或按可解释策略修复；不能凭空声称未知写操作成功，也不能把非法历史继续发给模型。具体策略在编码前选定。
+
+**拟议文件与接口：** 首先调整 `src/rivet/agent.py` 中批次结算和失败边界，`cli.py` / `web.py` 对齐保存与展示；必要时在 `context.py` 放置可复用的消息协议校验。内部可采用 `settle_pending_calls` / `validate_tool_exchange` 一类小方法，名称和返回结构在设计时确定。新增 `tests/` 中的 fake-client 行为测试，并在 `.github/workflows/ci-cd.yml` 接入；Session JSON 不因本补丁默认升级或换库。
+
+| 类型 | 1-A 验收场景 | 期望 |
+| --- | --- | --- |
+| 正常 | 多工具响应后给最终回答 | 每个工具执行一次，结果 ID/顺序完整，既有 final 行为保持 |
+| 失败 | 无效参数或文件不存在，然后模型修正 | 错误观察进入下一次请求，任务仍可完成 |
+| 失败 | 第一次及执行若干 step 后 ModelError | 统一失败结果，计数符合选定口径，失败轮次可保存并继续 |
+| 失败 | 压缩取消、模型取消、工具执行中取消 | cancelled 终态；剩余工具不执行，消息完整，运行锁释放 |
+| 失败 | tool_start/tool_end/审批回调抛错 | 不遗失已执行结果，不重复执行副作用，停止历史可诊断 |
+| 边界 | 同批 4 个相同调用，第 3 个触发 guard | 仅执行前 3 个，第 4 个有明确未执行结果 |
+| 边界 | 缺结果、重复 ID、孤立结果的保存历史 | 恢复/发送前按设计拒绝或修复，不默默接受 |
+| 边界 | 停止后 export/restore，再继续一个 turn | fake client 检查每个历史批次合法，任务能继续；保存失败也可明确反馈 |
+
+测试使用标准库 `unittest`、FakeClient、临时工作区及内存事件收集器即可；当前项目无运行时第三方依赖，无需为这一步引入 Agent 框架或外部模型。测试主要断言对外行为，不以复制内部实现作为断言依据。
+
+**未来实现后的验证命令（当前 tests 尚未创建，不能现在据此宣称测试通过）：**
+
+```powershell
+$env:PYTHONPATH = (Join-Path (Get-Location) 'src')
+python -B -m unittest discover -s tests -p 'test_*.py' -v
+node --check src/rivet/webui/app.js
+```
+
+预期：全部新增回归通过，现有 CI context smoke 继续通过。人工验证时，在临时项目通过 TUI 和 Web 分别进行一次普通任务、执行中取消、失败后继续及保存后恢复，确认停止原因一致、没有重复工具执行。自动测试用 FakeClient；真实模型手工验证是后续独立检查，不能用本次离线审计代替。
+
+**下一轮可以直接给开发 Agent 的任务：**
+
+> 基于 docs/CAWORKER_GAP_ANALYSIS.md 的当前 Tenon 基线，进入 Phase 1-A，先只提交设计，不修改源码。阅读 Agent.run/_run_turn、工具批次结果追加、Context restore、TUI/Web 失败保存路径。针对 G01/G02，输出 Goal、Current Problem、Proposed Architecture、Files to Modify、New Interfaces、Compatibility Risks 及 normal/failure/boundary 测试矩阵。明确未执行与结果未知的区别、steps 计数口径、事件回调失败策略和旧会话非法工具对处理方式。复用现有 Agent/ToolRegistry/ContextManager/SessionStore，设计确定后再分两个小补丁编码，不扩展到 Plan、数据库、Skill 或并发重构。
+
 ## Validation Evidence
 
 ### 已执行的检查
 
-环境：Python 3.12.3、Node.js 24.16.0。Python 使用 `-B` 避免生成字节码；直接构造虚拟 Config/FakeClient，不读取 dotenv、不调用真实模型、不启动 Web 服务。涉及 Web 流验证时使用 `WebRuntime.__new__()` 与 BytesIO，不实例化 SessionStore 或创建会话文件。
+本表为 2026-09-07 在 `10b44e7…` 上重新执行的结果。环境：Python 3.12.3、Node.js 24.16.0。Python 使用 `-B` 避免生成字节码；直接构造虚拟 Config/FakeClient，不读取 dotenv、不调用真实模型、不启动 Web 服务。涉及 Web 流验证时使用 `WebRuntime.__new__()` 与 BytesIO，不实例化 SessionStore 或创建会话文件。
 
 | 检查 | 观察结果 | 含义 |
 | --- | --- | --- |
@@ -372,6 +437,7 @@ Explore 和 Review 使用相同只读白名单，只在提示词职责上区分�
 | 相同 command 观察仅 duration_ms 不同 | 签名不同 | 命令耗时干扰 guard |
 | FakeClient 抛 ModelError | 逃出 Core；last_result=None | G02 已复现 |
 | 压缩 summarizer 抛 OperationCancelled | 逃出 Core；last_result=None | 压缩取消边界缺口 |
+| 同批 a/b 调用，首个 tool_end 回调抛 RuntimeError | 逃出 Core；b 无结果；last_result=None | G02 事件异常边界新增复现 |
 | 5,000 字符输入，1,000 字符预算 | 不压缩且仍超限 | max_chars 不是硬上限 |
 | 虚拟修改后成功 verify，tracking_complete=False | verification_passed=True | 跟踪完整性未进入验证门槛 |
 | 合成 secret 作为事件 result 传给 BytesIO | 输出仍包含合成 secret | 流通道未统一脱敏 |
@@ -443,10 +509,12 @@ except OperationCancelled:
 
 ### 交付边界
 
-本次唯一新增文件为 `docs/CAWORKER_GAP_ANALYSIS.md`。源码（排除 `__pycache__`）的路径及字节内容聚合 SHA-256 基线为：
+本次唯一修改文件为 `docs/CAWORKER_GAP_ANALYSIS.md`。当前源码清单 SHA-256 为：
 
 ```text
-1c7301f76e0b3c508f215c5cdc44d61cfe298359ca248e116d0b5b05f5115ed7
+4897f1e661db6f497fcada89d16c2d8c688ee1eec188580f4d8ebcbbb53fb858
 ```
 
-交付检查使用 Git 状态、已有跟踪文件 diff 与源码哈希确认未改代码。没有重构、安装依赖、修改配置、创建正式测试、提交 Git 或进入下一阶段。
+算法：对 `src/` 下所有文件（排除 `__pycache__`）按路径排序，每条生成 `POSIX相对路径 + NUL + SHA256(文件原始字节)`，以换行连接、UTF-8 编码后再次 SHA-256。此值用于本次修改前后对比；旧报告未给出相同算法，不能直接用两个不同清单哈希证明版本差异。
+
+交付检查使用 Git 状态、diff 和上述源码哈希确认未改代码。没有重构、安装依赖、修改配置、创建正式测试、提交 Git 或进入 Phase 1 编码。未重新构建 wheel、运行远端 CI、验证真实 API、执行真实 shell 工具或测试完整会话落盘/恢复；源码资源检查通过不能替代安装包资源验收。
