@@ -13,7 +13,6 @@ from .workspace import Workspace
 
 
 Approver = Callable[[str, str], bool]
-DelegateHandler = Callable[..., JsonObject]
 SkillHandler = Callable[..., JsonObject]
 HistorySearchHandler = Callable[..., JsonObject]
 
@@ -47,9 +46,6 @@ class ToolRegistry:
         event_handler: EventHandler | None = None,
         cancel_event: threading.Event | None = None,
         workspace: Workspace | None = None,
-        tool_scope: str = "full",
-        delegate_handler: DelegateHandler | None = None,
-        delegate_many_handler: DelegateHandler | None = None,
         skill_list_handler: SkillHandler | None = None,
         skill_activate_handler: SkillHandler | None = None,
         skill_resource_handler: SkillHandler | None = None,
@@ -64,27 +60,11 @@ class ToolRegistry:
         self.approver = approver
         self.plan = plan if plan is not None else PlanState()
         self.events = event_handler or (lambda _event, _data: None)
-        if tool_scope not in {"full", "read_only"}:
-            raise ValueError(f"unsupported tool scope: {tool_scope}")
-        self.tool_scope = tool_scope
-        self.delegate_handler = delegate_handler
-        self.delegate_many_handler = delegate_many_handler
         self.skill_list_handler = skill_list_handler
         self.skill_activate_handler = skill_activate_handler
         self.skill_resource_handler = skill_resource_handler
         self.history_search_handler = history_search_handler
-        tools = self._build_tools()
-        if tool_scope == "read_only":
-            allowed = {
-                "update_plan",
-                "list_files",
-                "read_file",
-                "search_text",
-                "search_history",
-                "show_diff",
-            }
-            tools = tuple(tool for tool in tools if tool.name in allowed)
-        self._tools = {tool.name: tool for tool in tools}
+        self._tools = {tool.name: tool for tool in self._build_tools()}
 
     @property
     def schemas(self) -> list[JsonObject]:
@@ -483,78 +463,6 @@ class ToolRegistry:
                 ),
             ]
         )
-        if self.delegate_handler is not None:
-            tools.append(
-                ToolSpec(
-                    "delegate_task",
-                    "Delegate one bounded specialist task to an isolated sub-agent and return "
-                    "a structured evidence report. Explorer locates relevant code and evidence; "
-                    "reviewer independently checks correctness and risks. Both are read-only; "
-                    "the main agent must perform every file change and command.",
-                    {
-                        **object_schema,
-                        "properties": {
-                            "task": {
-                                "type": "string",
-                                "minLength": 1,
-                                "maxLength": 12000,
-                            },
-                            "mode": {
-                                "type": "string",
-                                "enum": ["explore", "review"],
-                            },
-                            "label": {
-                                "type": "string",
-                                "minLength": 1,
-                                "maxLength": 80,
-                            },
-                        },
-                        "required": ["task", "mode"],
-                    },
-                    self.delegate_handler,
-                )
-            )
-        if self.delegate_many_handler is not None:
-            tools.append(
-                ToolSpec(
-                    "delegate_readonly_tasks",
-                    "Run exactly two independent read-only exploration or review assignments "
-                    "in parallel and return one structured report per sub-agent.",
-                    {
-                        **object_schema,
-                        "properties": {
-                            "tasks": {
-                                "type": "array",
-                                "minItems": 2,
-                                "maxItems": 2,
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "task": {
-                                            "type": "string",
-                                            "minLength": 1,
-                                            "maxLength": 12000,
-                                        },
-                                        "mode": {
-                                            "type": "string",
-                                            "enum": ["explore", "review"],
-                                        },
-                                        "label": {
-                                            "type": "string",
-                                            "minLength": 1,
-                                            "maxLength": 80,
-                                        },
-                                    },
-                                    "required": ["task", "mode"],
-                                },
-                            }
-                        },
-                        "required": ["tasks"],
-                    },
-                    self.delegate_many_handler,
-                )
-            )
         if self.skill_list_handler is not None:
             tools.append(
                 ToolSpec(

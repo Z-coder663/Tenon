@@ -5,7 +5,7 @@ import hashlib
 import json
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any
 
 from .config import Config
 from .context import ContextManager, STRUCTURED_SUMMARY_INSTRUCTIONS
@@ -13,7 +13,6 @@ from .errors import OperationCancelled, SessionError
 from .plan import PlanState
 from .prompt import system_prompt
 from .skills import SkillRegistry
-from .subagents import SubAgentManager
 from .tools import Approver, ToolRegistry
 from .types import EventHandler, JsonObject, Message, ModelClient, ModelReply, ToolCall
 from .workspace import Workspace
@@ -207,36 +206,20 @@ class Agent:
         *,
         event_handler: EventHandler | None = None,
         approver: Approver | None = None,
-        client_factory: Callable[[], ModelClient] | None = None,
-        workspace: Workspace | None = None,
-        tool_scope: str = "full",
-        enable_delegation: bool = True,
         cancel_event: threading.Event | None = None,
-        system_prompt_text: str | None = None,
     ) -> None:
         self.config = config
         self.client = client
-        self._parallel_delegation = client_factory is not None
-        self.client_factory = client_factory or (lambda: self.client)
         self.events = event_handler or (lambda _event, _data: None)
         self.approver = approver
-        self._shared_workspace = workspace
-        self._tool_scope = tool_scope
-        self._enable_delegation = enable_delegation
         self._cancel_event = cancel_event or threading.Event()
         self._owns_cancel_event = cancel_event is None
-        self.skills = (
-            SkillRegistry(self.config.workspace, event_handler=self.events)
-            if tool_scope == "full" and system_prompt_text is None
-            else None
+        self.skills = SkillRegistry(
+            self.config.workspace, event_handler=self.events
         )
-        self._system_prompt = system_prompt_text or system_prompt(
+        self._system_prompt = system_prompt(
             self.config.workspace,
-            (
-                self.skills.catalog_prompt()
-                if self.skills is not None
-                else "- No skills are currently available."
-            ),
+            self.skills.catalog_prompt(),
         )
         self._run_state_lock = threading.Lock()
         self._running = False
@@ -250,12 +233,12 @@ class Agent:
                 self.config.workspace, self.skills.catalog_prompt()
             )
         self.plan = PlanState()
-        workspace = self._shared_workspace or Workspace(
+        workspace = Workspace(
             self.config.workspace,
             max_output_chars=self.config.max_tool_output_chars,
             cancel_event=self._cancel_event,
         )
-        self.tools, self.subagents = self._build_runtime(self.plan, workspace)
+        self.tools = self._build_runtime(self.plan, workspace)
         self.context: ContextManager | None = None
         self.transcript: list[JsonObject] = []
         self.state = TaskState()
@@ -290,14 +273,6 @@ class Agent:
             "recovery": self.recovery_snapshot(),
             "operations": self.tools.workspace.operation_history(),
             "plan": self.plan.snapshot(),
-            "subagents": (
-                self.subagents.snapshot()
-                if self.subagents
-                else {
-                    "active": [],
-                    "history": [],
-                }
-            ),
             "skills": (
                 self.skills.snapshot()
                 if self.skills is not None
@@ -332,8 +307,6 @@ class Agent:
                 updated = replace(self.config, approval_mode=normalized)
                 self.config = updated
                 self.tools.config = updated
-                if self.subagents is not None:
-                    self.subagents.config = updated
         return {"mode": normalized, "changed": changed}
 
     def show_diff(self, path: str | None = None) -> JsonObject:
@@ -453,7 +426,6 @@ class Agent:
             "plan_state": self.plan.export_state(),
             "task_state": self.state.export_state(),
             "workspace_state": self.tools.workspace.export_diff_state(),
-            "subagent_state": self.subagents.export_state() if self.subagents else None,
             "skill_state": (
                 self.skills.export_state() if self.skills is not None else None
             ),
@@ -507,11 +479,7 @@ class Agent:
             raise SessionError(f"saved workspace state is invalid: {exc}") from exc
         restored_state.record_external_changes(drifted)
 
-        restored_tools, restored_subagents = self._build_runtime(
-            restored_plan, restored_workspace
-        )
-        if restored_subagents is not None:
-            restored_subagents.restore_state(payload.get("subagent_state"))
+        restored_tools = self._build_runtime(restored_plan, restored_workspace)
         if self.skills is not None:
             try:
                 self.skills.restore_state(payload.get("skill_state"))
@@ -519,7 +487,6 @@ class Agent:
                 raise SessionError(f"saved skill state is invalid: {exc}") from exc
 
         self.tools = restored_tools
-        self.subagents = restored_subagents
         self.plan = restored_plan
         self.context = restored_context
         self.transcript = restored_transcript
@@ -544,10 +511,8 @@ class Agent:
             self._running = True
             if self.skills is not None:
                 self.skills.begin_turn(self.turns + 1)
-            if self.subagents is not None:
-                self.subagents.begin_turn()
         try:
-            if task.strip() and self._tool_scope == "full":
+            if task.strip():
                 self.tools.workspace.begin_turn_operation(self.turns + 1, task)
                 checkpoint_started = True
             return self._run_turn(task)
@@ -572,8 +537,6 @@ class Agent:
         cancel_client = getattr(self.client, "cancel", None)
         if callable(cancel_client):
             cancel_client()
-        if self.subagents is not None:
-            self.subagents.cancel_active()
         return True
 
     def record_failure(self, final: str, reason: str = "runtime_error") -> AgentResult:
@@ -1016,47 +979,24 @@ class Agent:
         return {
             **state.snapshot(),
             "plan": self.plan.snapshot(),
-            "subagents": (
-                self.subagents.snapshot()
-                if self.subagents
-                else {
-                    "active": [],
-                    "history": [],
-                }
-            ),
             "skills": self.skill_snapshot(),
         }
 
     def _build_runtime(
         self, plan: PlanState, workspace: Workspace
-    ) -> tuple[ToolRegistry, SubAgentManager | None]:
-        manager: SubAgentManager | None = None
-        if self._enable_delegation:
-            manager = SubAgentManager(
-                self.config,
-                self.client_factory,
-                workspace,
-                event_handler=self.events,
-                cancel_event=self._cancel_event,
-            )
-        registry = ToolRegistry(
+    ) -> ToolRegistry:
+        return ToolRegistry(
             self.config,
             approver=self.approver,
             plan=plan,
             event_handler=self.events,
             cancel_event=self._cancel_event,
             workspace=workspace,
-            tool_scope=self._tool_scope,
-            delegate_handler=manager.delegate if manager else None,
-            delegate_many_handler=(
-                manager.delegate_many if manager and self._parallel_delegation else None
-            ),
             skill_list_handler=self.skills.list_skills if self.skills else None,
             skill_activate_handler=self.skills.activate if self.skills else None,
             skill_resource_handler=self.skills.read_resource if self.skills else None,
             history_search_handler=self._search_history,
         )
-        return registry, manager
 
     def _append_transcript(self, role: str, content: str, turn: int) -> None:
         text = content.strip()

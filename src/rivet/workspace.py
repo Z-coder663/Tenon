@@ -37,19 +37,6 @@ SNAPSHOT_TEXT_FILE_BYTES = 2_000_000
 SNAPSHOT_TEXT_BUDGET_BYTES = 20_000_000
 SNAPSHOT_CHANGE_REPORT_LIMIT = 200
 SNAPSHOT_IGNORED_FILES = {".coverage", ".DS_Store"}
-PREVIEW_DENIED_DIRECTORIES = {".aws", ".gnupg", ".ssh"}
-PREVIEW_DENIED_FILES = {
-    ".env",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    "credentials",
-    "id_dsa",
-    "id_ed25519",
-    "id_ecdsa",
-    "id_rsa",
-}
-PREVIEW_DENIED_SUFFIXES = {".key", ".p12", ".pfx", ".pem"}
 OPERATION_HISTORY_LIMIT = 200
 OPERATION_FILES_LIMIT = 2_000
 
@@ -456,56 +443,6 @@ class Workspace:
             "truncated": len(entries) > max_entries,
         }
 
-    def preview_file(self, path: str, *, max_bytes: int = 500_000) -> dict[str, Any]:
-        """Return a bounded UTF-8 file preview for the local Web UI."""
-        if not 1 <= max_bytes <= 2_000_000:
-            raise ToolError("preview byte limit must be between 1 and 2000000")
-        target = self.resolve(path, must_exist=True)
-        if not self.preview_allowed(self.display(target)):
-            raise ToolError("sensitive files are hidden from Web preview")
-        if target.is_symlink() or not target.is_file():
-            raise ToolError(f"not a regular file: {path}")
-        try:
-            size = target.stat().st_size
-            with target.open("rb") as stream:
-                data = stream.read(max_bytes + 1)
-        except OSError as exc:
-            raise ToolError(f"could not read {path}: {exc}") from exc
-        if b"\x00" in data[:4096]:
-            raise ToolError(f"binary file cannot be previewed: {path}")
-        truncated = len(data) > max_bytes
-        if truncated:
-            data = data[:max_bytes]
-        try:
-            content = data.decode("utf-8-sig")
-        except UnicodeDecodeError as exc:
-            raise ToolError(f"file is not UTF-8 text: {path}") from exc
-        changed_files = self.show_diff().get("files", [])
-        return {
-            "path": self.display(target),
-            "content": content,
-            "size": size,
-            "lines": content.count("\n") + (1 if content else 0),
-            "truncated": truncated,
-            "changed": self.display(target) in changed_files,
-        }
-
-    @staticmethod
-    def preview_allowed(path: str) -> bool:
-        """Return whether a workspace entry may be exposed in the Web file browser."""
-        normalized = path.rstrip("/")
-        parts = [part.casefold() for part in Path(normalized).parts]
-        if any(part in PREVIEW_DENIED_DIRECTORIES for part in parts):
-            return False
-        if not parts:
-            return True
-        name = parts[-1]
-        if name == ".env.example":
-            return True
-        if name in PREVIEW_DENIED_FILES or name.startswith(".env."):
-            return False
-        return Path(name).suffix.casefold() not in PREVIEW_DENIED_SUFFIXES
-
     def search_text(
         self,
         query: str,
@@ -639,35 +576,6 @@ class Workspace:
             "files": changed_files,
             "diff": self._truncate(full_diff),
             "truncated": len(full_diff) > self.max_output_chars,
-        }
-
-    def preview_diff(self, path: str | None = None) -> dict[str, Any]:
-        """Return a Web-safe diff that omits credential-bearing paths."""
-        if path is not None:
-            if not self.preview_allowed(path):
-                raise ToolError("sensitive files are hidden from Web diff")
-            return self.show_diff(path)
-
-        complete = self.show_diff()
-        files = complete.get("files", [])
-        visible = [
-            item
-            for item in files
-            if isinstance(item, str) and self.preview_allowed(item)
-        ]
-        hidden_count = len(files) - len(visible) if isinstance(files, list) else 0
-        parts: list[str] = []
-        truncated = False
-        for item in visible:
-            item_diff = self.show_diff(item)
-            parts.append(str(item_diff.get("diff") or ""))
-            truncated = truncated or bool(item_diff.get("truncated"))
-        combined = "".join(parts)
-        return {
-            "files": visible,
-            "diff": self._truncate(combined),
-            "truncated": truncated or len(combined) > self.max_output_chars,
-            "hidden_files": hidden_count,
         }
 
     def revert_changes(self, path: str | None = None) -> dict[str, Any]:

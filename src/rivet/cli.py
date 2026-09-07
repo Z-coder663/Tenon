@@ -44,22 +44,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="test streaming and a function-tool round trip, then exit",
     )
-    parser.add_argument(
-        "--web",
-        action="store_true",
-        help="open the local browser interface instead of the terminal UI",
-    )
-    parser.add_argument(
-        "--web-port",
-        type=int,
-        default=8765,
-        help="local web interface port; use 0 to choose a free port",
-    )
-    parser.add_argument(
-        "--no-open",
-        action="store_true",
-        help="start the web interface without opening a browser",
-    )
     parser.add_argument("--version", action="version", version=f"Rivet {__version__}")
     return parser
 
@@ -68,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_terminal_encoding()
     args = build_parser().parse_args(argv)
     console = Console()
-    if not args.check_model and not args.web and not sys.stdin.isatty():
+    if not args.check_model and not sys.stdin.isatty():
         console.error("Interactive mode requires terminal input.")
         return 2
 
@@ -87,21 +71,11 @@ def main(argv: list[str] | None = None) -> int:
         client = create_model_client(config)
         if args.check_model:
             return run_model_check(config, client)
-        if args.web:
-            from .web import run_web
-
-            return run_web(
-                config,
-                client,
-                port=args.web_port,
-                open_browser=not args.no_open,
-            )
         agent = Agent(
             config,
             client,
             event_handler=console.event,
             approver=console.approve,
-            client_factory=lambda: create_model_client(config),
         )
         return run_interactive(config, agent, console=console)
     except KeyboardInterrupt:

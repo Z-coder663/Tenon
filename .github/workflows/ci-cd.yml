@@ -61,9 +61,6 @@ jobs:
 
           root = files("rivet")
           required = (
-              root.joinpath("webui", "index.html"),
-              root.joinpath("webui", "app.js"),
-              root.joinpath("webui", "styles.css"),
               root.joinpath("builtin_skills", "bug-diagnosis", "SKILL.md"),
           )
           missing = [str(path) for path in required if not path.is_file()]
@@ -201,8 +198,8 @@ jobs:
           if restored.search_history(marker, max_results=5)["count"] < 1:
               raise SystemExit("Archived history was lost after state restore")
 
-  web-and-package:
-    name: Web UI and distribution package
+  package:
+    name: Distribution package
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -215,15 +212,6 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          package-manager-cache: false
-
-      - name: Check Web UI JavaScript
-        run: node --check src/rivet/webui/app.js
 
       - name: Build wheel and source distribution
         run: |
@@ -244,9 +232,6 @@ jobs:
               names = set(archive.namelist())
 
           required_suffixes = (
-              "rivet/webui/index.html",
-              "rivet/webui/app.js",
-              "rivet/webui/styles.css",
               "rivet/builtin_skills/bug-diagnosis/SKILL.md",
           )
           missing = [
@@ -265,7 +250,7 @@ jobs:
     needs:
       - compatibility
       - context-smoke
-      - web-and-package
+      - package
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

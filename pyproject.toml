@@ -22,9 +22,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 rivet = [
-  "webui/*.html",
-  "webui/*.css",
-  "webui/*.js",
   "builtin_skills/*/SKILL.md",
   "builtin_skills/*/references/*",
 ]
