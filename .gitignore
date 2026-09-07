@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.vscode/
+.venv/
+.env
+.rivet/*
+!.rivet/skills/
+!.rivet/skills/**
+dist/
+build/
+

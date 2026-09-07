@@ -1,0 +1,306 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.10"
+          - "3.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Compile Python sources
+        run: python -m compileall -q src
+
+      - name: Check CLI entry point
+        run: rivet --help
+
+      - name: Check package resources
+        shell: python
+        run: |
+          from importlib.resources import files
+
+          root = files("rivet")
+          required = (
+              root.joinpath("webui", "index.html"),
+              root.joinpath("webui", "app.js"),
+              root.joinpath("webui", "styles.css"),
+              root.joinpath("builtin_skills", "bug-diagnosis", "SKILL.md"),
+          )
+          missing = [str(path) for path in required if not path.is_file()]
+          if missing:
+              raise SystemExit(f"Missing installed resources: {missing}")
+
+  context-smoke:
+    name: Context compression regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Exercise compression, retrieval, and restore
+        shell: python
+        run: |
+          from rivet.context import ContextManager
+
+          marker = "EARLY_ARCHITECTURE_DECISION"
+          manager = ContextManager(
+              system="CI smoke-test system prompt",
+              task=(
+                  "Keep the package name rivet and never place API keys "
+                  "in tracked files."
+              ),
+              max_chars=2_000,
+              summarizer=None,
+              recent_units=6,
+          )
+          manager.append({
+              "role": "assistant",
+              "content": f"{marker}: the initial module layout was inspected.",
+          })
+          manager.append({
+              "role": "assistant",
+              "content": None,
+              "tool_calls": [{
+                  "id": "call_pair",
+                  "type": "function",
+                  "function": {
+                      "name": "read_file",
+                      "arguments": '{"path":"pyproject.toml"}',
+                  },
+              }],
+          })
+          manager.append({
+              "role": "tool",
+              "tool_call_id": "call_pair",
+              "content": "project metadata inspected",
+          })
+          for index in range(12):
+              manager.append({
+                  "role": "assistant",
+                  "content": f"implementation note {index}: " + ("x" * 350),
+              })
+
+          result = manager.compact(force=True)
+          if not result:
+              raise SystemExit("Expected forced compaction to archive messages")
+          if manager.last_compaction.get("summary_source") != "fallback":
+              raise SystemExit(
+                  "Expected deterministic fallback summary, got "
+                  f"{manager.last_compaction.get('summary_source')!r}"
+              )
+          summary = next(
+              str(message.get("content") or "")
+              for message in manager.messages
+              if message.get("name") == ContextManager.SUMMARY_NAME
+          )
+          missing_sections = [
+              section
+              for section in ContextManager.SUMMARY_SECTIONS
+              if f"## {section}" not in summary
+          ]
+          if missing_sections:
+              raise SystemExit(f"Summary sections missing: {missing_sections}")
+
+          hits = manager.search_history(marker, max_results=5)
+          if hits["count"] < 1:
+              raise SystemExit("Archived history was not searchable")
+
+          active_ids = {
+              call.get("id")
+              for message in manager.messages
+              for call in message.get("tool_calls", [])
+          }
+          active_results = {
+              message.get("tool_call_id")
+              for message in manager.messages
+              if message.get("role") == "tool"
+          }
+          archived_messages = [
+              message
+              for unit in manager.archived_units
+              for message in unit
+          ]
+          archived_ids = {
+              call.get("id")
+              for message in archived_messages
+              for call in message.get("tool_calls", [])
+          }
+          archived_results = {
+              message.get("tool_call_id")
+              for message in archived_messages
+              if message.get("role") == "tool"
+          }
+          if ("call_pair" in active_ids) != ("call_pair" in active_results):
+              raise SystemExit("Tool call and result were split by compaction")
+          if ("call_pair" in archived_ids) != ("call_pair" in archived_results):
+              raise SystemExit("Archived tool call and result were split")
+          if "call_pair" not in active_ids and "call_pair" not in archived_ids:
+              raise SystemExit("Tool call pair disappeared during compaction")
+
+          restored = ContextManager.restore(
+              "CI smoke-test system prompt",
+              manager.export_conversation(),
+              manager.max_chars,
+              summarizer=None,
+              context_state=manager.export_state(),
+              recent_units=manager.recent_units,
+          )
+          if restored.search_history(marker, max_results=5)["count"] < 1:
+              raise SystemExit("Archived history was lost after state restore")
+
+  web-and-package:
+    name: Web UI and distribution package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Check Web UI JavaScript
+        run: node --check src/rivet/webui/app.js
+
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Inspect built wheel
+        shell: python
+        run: |
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected one wheel, found: {wheels}")
+
+          with ZipFile(wheels[0]) as archive:
+              names = set(archive.namelist())
+
+          required_suffixes = (
+              "rivet/webui/index.html",
+              "rivet/webui/app.js",
+              "rivet/webui/styles.css",
+              "rivet/builtin_skills/bug-diagnosis/SKILL.md",
+          )
+          missing = [
+              suffix
+              for suffix in required_suffixes
+              if not any(name.endswith(suffix) for name in names)
+          ]
+          if missing:
+              raise SystemExit(f"Wheel resources missing: {missing}")
+          if any(Path(name).name == ".env" for name in names):
+              raise SystemExit("A .env file was included in the wheel")
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - compatibility
+      - context-smoke
+      - web-and-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Check tag matches package version
+        shell: python
+        run: |
+          import os
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          expected = f"v{project['project']['version']}"
+          actual = os.environ["GITHUB_REF_NAME"]
+          if actual != expected:
+              raise SystemExit(
+                  f"Release tag {actual!r} does not match package version {expected!r}"
+              )
+
+      - name: Build release artifacts
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes --verify-tag
