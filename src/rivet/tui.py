@@ -12,6 +12,15 @@ from typing import Any, Callable, TextIO
 from . import __version__
 from .agent import AgentResult
 from .config import Config
+from .outcomes import (
+    CANCELLED,
+    DENIED,
+    FAILED,
+    SKIPPED,
+    SUCCEEDED,
+    TIMED_OUT,
+    ToolOutcome,
+)
 from .session import SessionSummary
 from .types import JsonObject
 
@@ -750,27 +759,26 @@ class Console:
         return width
 
     def _tool_result(self, name: str, raw_result: str) -> None:
-        try:
-            result = json.loads(raw_result)
-        except json.JSONDecodeError:
+        parsed = ToolOutcome.from_json(raw_result)
+        if parsed is None:
             marker = self.style(self.glyph("failure"), self.RED)
             print(f"    {marker} invalid tool result", file=self.output)
             return
+        outcome, result = parsed
 
-        if not result.get("ok"):
-            cancelled = result.get("cancelled") is True
+        command_observed = name == "run_command" and outcome.execution_state == "executed"
+        if outcome.status != SUCCEEDED and not command_observed:
+            warning = outcome.status in {CANCELLED, DENIED, SKIPPED, TIMED_OUT}
             marker = self.style(
-                "!" if cancelled else self.glyph("failure"),
-                self.YELLOW if cancelled else self.RED,
+                "!" if warning else self.glyph("failure"),
+                self.YELLOW if warning else self.RED,
             )
-            detail = self._truncate(str(result.get("error") or "tool failed"), 180)
+            detail = self._truncate(str(outcome.error or "tool failed"), 180)
             print(f"    {marker} {detail}", file=self.output)
             return
 
-        command_cancelled = name == "run_command" and result.get("cancelled") is True
-        command_failed = name == "run_command" and (
-            result.get("timed_out") or result.get("exit_code") != 0
-        )
+        command_cancelled = name == "run_command" and outcome.status == CANCELLED
+        command_failed = name == "run_command" and outcome.status in {FAILED, TIMED_OUT}
         if command_cancelled:
             marker = self.style("!", self.YELLOW)
         elif command_failed:

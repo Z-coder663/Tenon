@@ -10,6 +10,14 @@ from typing import Any
 from .config import Config
 from .context import ContextManager, STRUCTURED_SUMMARY_INSTRUCTIONS
 from .errors import ModelError, OperationCancelled, SessionError
+from .outcomes import (
+    CANCELLED,
+    EXECUTION_UNKNOWN,
+    NOT_EXECUTED,
+    SKIPPED,
+    UNKNOWN,
+    ToolOutcome,
+)
 from .plan import PlanState
 from .prompt import system_prompt
 from .skills import SkillRegistry
@@ -79,11 +87,13 @@ class TaskState:
 
     def record_tool_result(self, name: str, result: str) -> None:
         self.operation_index += 1
-        try:
-            payload: Any = json.loads(result)
-        except json.JSONDecodeError:
+        parsed = ToolOutcome.from_json(result)
+        if parsed is None:
             return
-        if not isinstance(payload, dict) or not payload.get("ok"):
+        outcome, payload = parsed
+        if name != "run_command" and not outcome.succeeded:
+            return
+        if name == "run_command" and outcome.execution_state != "executed":
             return
 
         path = payload.get("path")
@@ -738,6 +748,7 @@ class Agent:
                             reason="runtime_error",
                             phase=f"tool {call.name}",
                         )
+                    result_unknown = self._tool_result_unknown(result)
                     self._append_tool_observation(
                         context,
                         state,
@@ -745,6 +756,7 @@ class Agent:
                         result,
                         step=step,
                         turn=turn,
+                        record_state=not result_unknown,
                     )
                     if self._tool_was_cancelled(result) or self._cancel_event.is_set():
                         self._settle_tool_calls(
@@ -756,6 +768,28 @@ class Agent:
                         )
                         return self._cancelled_result(
                             context, state, step, turn, f"tool {call.name}"
+                        )
+                    if result_unknown:
+                        parsed = ToolOutcome.from_json(result)
+                        detail = (
+                            parsed[0].error
+                            if parsed is not None and parsed[0].error
+                            else f"{call.name} returned an unknown result"
+                        )
+                        self._settle_tool_calls(
+                            context,
+                            reply.tool_calls[call_index + 1 :],
+                            code="SKIPPED",
+                            detail="skipped after an earlier tool returned an unknown result",
+                        )
+                        return self._runtime_failure_result(
+                            context,
+                            state,
+                            step,
+                            turn,
+                            RuntimeError(detail),
+                            reason="runtime_error",
+                            phase=f"tool {call.name}",
                         )
                     observation = self._observation_signature(call, result)
                     if observation == previous_observation:
@@ -1347,35 +1381,26 @@ class Agent:
 
     @staticmethod
     def _cancelled_tool_payload(name: str) -> str:
-        return json.dumps(
-            {
-                "ok": False,
-                "cancelled": True,
-                "result_unknown": True,
-                "execution_state": "unknown",
-                "error": f"{name} was cancelled; its execution result is unknown",
-                "code": "CANCELLED",
-                "retryable": False,
-            },
-            ensure_ascii=False,
-        )
+        return ToolOutcome(
+            CANCELLED,
+            "CANCELLED",
+            EXECUTION_UNKNOWN,
+            False,
+            f"{name} was cancelled; its execution result is unknown",
+        ).to_json({"cancelled": True, "result_unknown": True})
 
     @staticmethod
     def _unknown_tool_payload(name: str, exc: Exception) -> str:
-        return json.dumps(
-            {
-                "ok": False,
-                "result_unknown": True,
-                "execution_state": "unknown",
-                "error": (
-                    f"{name} stopped without a confirmed result: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-                "code": "RESULT_UNKNOWN",
-                "retryable": False,
-            },
-            ensure_ascii=False,
-        )
+        return ToolOutcome(
+            UNKNOWN,
+            "RESULT_UNKNOWN",
+            EXECUTION_UNKNOWN,
+            False,
+            (
+                f"{name} stopped without a confirmed result: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ).to_json({"result_unknown": True})
 
     @staticmethod
     def _settled_tool_payload(
@@ -1386,28 +1411,34 @@ class Agent:
         cancelled: bool = False,
         result_unknown: bool = False,
     ) -> str:
-        payload: JsonObject = {
-            "ok": False,
-            "execution_state": "unknown" if result_unknown else "not_executed",
-            "error": f"{name} {detail}",
-            "code": code,
-            "retryable": False,
-        }
+        status = UNKNOWN if result_unknown else SKIPPED
+        execution_state = EXECUTION_UNKNOWN if result_unknown else NOT_EXECUTED
+        payload: JsonObject = {}
         if result_unknown:
             payload["result_unknown"] = True
         else:
             payload["skipped"] = True
         if cancelled:
             payload["cancelled"] = True
-        return json.dumps(payload, ensure_ascii=False)
+            if not result_unknown:
+                status = CANCELLED
+        return ToolOutcome(
+            status,
+            code,
+            execution_state,
+            False,
+            f"{name} {detail}",
+        ).to_json(payload)
 
     @staticmethod
     def _tool_was_cancelled(result: str) -> bool:
-        try:
-            payload: Any = json.loads(result)
-        except json.JSONDecodeError:
-            return False
-        return isinstance(payload, dict) and payload.get("cancelled") is True
+        parsed = ToolOutcome.from_json(result)
+        return parsed is not None and parsed[0].status == CANCELLED
+
+    @staticmethod
+    def _tool_result_unknown(result: str) -> bool:
+        parsed = ToolOutcome.from_json(result)
+        return parsed is not None and parsed[0].result_unknown
 
     @staticmethod
     def _saved_counter(payload: JsonObject, name: str) -> int:

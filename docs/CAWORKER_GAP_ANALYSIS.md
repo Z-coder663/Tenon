@@ -39,6 +39,8 @@ The main execution path is concentrated in `Agent.run()` and `_run_turn()`. Mode
 - Tool-exchange validation before restore, export and model requests.
 - Event callback failure isolation with diagnostic status records.
 - Offline Agent lifecycle and context protocol regression tests in CI.
+- Canonical ToolOutcome status, error code, execution state and retry semantics.
+- Backward-compatible interpretation of legacy tool and command results.
 
 ## Partially Implemented Features
 
@@ -56,11 +58,9 @@ Current detection compares consecutive complete call-result signatures. It misse
 
 Recommended change: track call, normalized observation and progress separately; add a sliding window, total tool budget and turn deadline.
 
-### G04 — Tool outcome semantics are not uniform
+### G04 — Tool outcome semantics (completed in Phase 1-B)
 
-Schema errors are structured, but filesystem errors, denial, timeout, cancellation and command non-zero exits do not share one typed outcome. A command can be a successfully executed tool operation while its process result failed, which consumers must currently infer from special fields.
-
-Recommended change: introduce a compatible ToolOutcome/Error protocol and preserve existing fields during migration.
+All new tool observations now include canonical `status`, `code`, `execution_state` and `retryable` fields. Schema rejection, permission denial, known execution failure, timeout, cancellation, skipped execution and result-unknown boundaries have distinct status values. Command non-zero exits are explicitly `failed`, while the legacy `ok=true` field is retained for compatibility with consumers that interpret it as successful process dispatch. Agent state and TUI behavior use the canonical parser, which also infers equivalent outcomes from old saved observations.
 
 ### G05 — Plan exists, Plan Mode does not
 
@@ -118,8 +118,8 @@ MCP, Plugin Marketplace, browser automation, multimodal input and remote executi
 | Capability | Current state | Refactoring priority |
 | --- | --- | --- |
 | Agent Loop | Implemented; settlement and Core error boundary completed | High / Phase 1-C |
-| Tool System | Registry and validation implemented; outcome semantics incomplete | High / Phase 1 |
-| Error Recovery | Tool self-correction, HTTP retry and normalized Core failures exist | High / Phase 1-B |
+| Tool System | Registry, validation and canonical outcome semantics implemented | High / Phase 1-C |
+| Error Recovery | Tool self-correction, HTTP retry and normalized Core/tool failures exist | High / Phase 1-C |
 | Loop Guard | Consecutive duplicate detection and max steps only | High / Phase 1 |
 | Plan / Todo | PlanState exists; no Plan Mode or stable task IDs | Medium / Phase 2 |
 | Permission | safe/ask/never and resource rules exist; no unified engine | High / Phase 2 |
@@ -143,7 +143,7 @@ MCP, Plugin Marketplace, browser automation, multimodal input and remote executi
 | Phase | Work | Acceptance focus |
 | --- | --- | --- |
 | Phase 1-A (completed) | Tool-call settlement and unified turn finalization | No orphan call IDs; failure/cancellation produces a result; TUI saves returned failures |
-| Phase 1-B | ToolOutcome and error classification | Schema, execution, denial, timeout and process failure have clear semantics |
+| Phase 1-B (completed) | ToolOutcome and error classification | Schema, execution, denial, timeout and process failure have clear semantics |
 | Phase 1-C | Loop Guard and execution budgets | Duplicate errors and cycles stop without false positives |
 | Phase 2 | Todo, Plan Mode and PolicyEngine | Approved plan revisions and a tested permission matrix |
 | Phase 3 | Session checkpoints and recovery | Safe restart without replaying unknown side effects |
@@ -153,4 +153,4 @@ MCP, Plugin Marketplace, browser automation, multimodal input and remote executi
 
 ## Next Task
 
-Proceed to Phase 1-B. Define a backward-compatible `ToolOutcome` and error taxonomy for successful execution, schema rejection, permission denial, cancellation, timeout, non-zero process exits and result-unknown boundaries. Preserve current observation fields while migrating consumers and extend the behavior suite around these outcome classes.
+Proceed to Phase 1-C. Replace the consecutive-only repeat counter with bounded no-progress detection that can identify short alternating cycles without treating legitimate repeated reads as failure. Add a total tool-call budget and a monotonic turn deadline, then cover the exact stop reasons and settlement behavior with fake-client tests.

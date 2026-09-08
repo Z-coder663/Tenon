@@ -7,6 +7,13 @@ from typing import Any, Callable
 
 from .config import Config
 from .errors import RivetError, ToolError
+from .outcomes import (
+    command_outcome,
+    denied_outcome,
+    failed_outcome,
+    rejected_outcome,
+    successful_outcome,
+)
 from .plan import PlanState
 from .types import EventHandler, JsonObject
 from .workspace import Workspace
@@ -73,31 +80,28 @@ class ToolRegistry:
     def execute(self, name: str, raw_arguments: str) -> str:
         tool = self._tools.get(name)
         if tool is None:
-            return self._json_error(f"unknown tool: {name}", code="UNKNOWN_TOOL")
+            return rejected_outcome(f"unknown tool: {name}", code="UNKNOWN_TOOL")
         try:
             arguments = json.loads(raw_arguments or "{}")
         except json.JSONDecodeError as exc:
-            return self._json_error(
+            return rejected_outcome(
                 f"arguments are not valid JSON: {exc.msg}", code="INVALID_ARGUMENT"
             )
         if not isinstance(arguments, dict):
-            return self._json_error(
+            return rejected_outcome(
                 "tool arguments must be a JSON object", code="INVALID_ARGUMENT"
             )
 
         validation_error = self._validate_value(tool.parameters, arguments)
         if validation_error is not None:
             message, field = validation_error
-            return self._json_error(
-                message, code="INVALID_ARGUMENT", field=field, retryable=True
-            )
+            return rejected_outcome(message, code="INVALID_ARGUMENT", field=field)
 
         if tool.mutating:
             if self.config.approval_mode == "never":
-                return self._json_error(
+                return denied_outcome(
                     "mutating tools are disabled by approval mode",
                     code="APPROVAL_REQUIRED",
-                    retryable=False,
                 )
             review_reason = None
             if name == "run_command":
@@ -112,45 +116,25 @@ class ToolRegistry:
                 if review_reason:
                     summary = f"[{review_reason}] {summary}"
                 if self.approver is None or not self.approver(name, summary):
-                    return self._json_error(
+                    return denied_outcome(
                         "operation was not approved by the user",
                         code="APPROVAL_REQUIRED",
-                        retryable=True,
                     )
 
         try:
             result = tool.handler(**arguments)
-            return json.dumps({"ok": True, **result}, ensure_ascii=False)
-        except TypeError as exc:
-            return self._json_error(
-                f"invalid arguments: {exc}", code="INVALID_ARGUMENT", retryable=True
-            )
+            if name == "run_command":
+                return command_outcome(result)
+            return successful_outcome(result)
         except (RivetError, OSError) as exc:
-            return self._json_error(str(exc), code="TOOL_ERROR", retryable=True)
+            return failed_outcome(str(exc), code="TOOL_ERROR", retryable=True)
         except Exception as exc:  # defensive boundary: never crash the agent loop
-            return self._json_error(
+            return failed_outcome(
                 f"unexpected {type(exc).__name__}: {exc}",
                 code="INTERNAL_ERROR",
                 retryable=False,
+                result_unknown=True,
             )
-
-    @staticmethod
-    def _json_error(
-        message: str,
-        *,
-        code: str = "TOOL_ERROR",
-        field: str | None = None,
-        retryable: bool = True,
-    ) -> str:
-        payload: JsonObject = {
-            "ok": False,
-            "error": message,
-            "code": code,
-            "retryable": retryable,
-        }
-        if field:
-            payload["field"] = field
-        return json.dumps(payload, ensure_ascii=False)
 
     @classmethod
     def _validate_value(

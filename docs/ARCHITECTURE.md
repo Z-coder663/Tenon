@@ -46,6 +46,8 @@ Every tool schema is sent to the model and enforced again locally. Unknown field
 
 Each assistant tool-call batch is settled before a turn returns. Executed calls receive their real observation, calls deliberately left unexecuted receive `SKIPPED`, and a dispatch-boundary failure that cannot prove whether a side effect occurred receives `RESULT_UNKNOWN`. Result-unknown calls are not replayed automatically. Context validation rejects duplicate IDs, orphan results and incomplete exchanges before state export, restore or another model request.
 
+`ToolOutcome` gives every new observation four canonical fields: `status`, `code`, `execution_state` and `retryable`. Status distinguishes success, request rejection, permission denial, known execution failure, timeout, cancellation, skipped work and an unknown result. Existing fields such as `ok`, `error`, `exit_code`, `timed_out` and `cancelled` remain in the JSON envelope so saved sessions and external consumers remain compatible. `ok` retains its historical process-dispatch meaning for command observations; consumers use `status` to determine whether the command itself succeeded.
+
 Mutating tools follow `safe`, `ask`, or `never` approval mode. Workspace paths are resolved before use and must remain inside the selected root. Commands run with a timeout, cancellation support, a dangerous-command blocklist and bounded returned output.
 
 ## Completion evidence
@@ -80,4 +82,4 @@ Compaction, model, protocol and unexpected tool-boundary failures return a norma
 
 ## Known reliability limits
 
-The current Runtime still needs uniform typed tool outcomes, broader loop/no-progress detection, a hard request budget, execution-time checkpoints and wider permission/command/recovery behavior coverage. These are tracked in `CAWORKER_GAP_ANALYSIS.md`.
+The current Runtime still needs broader loop/no-progress detection, execution budgets, a hard request budget, execution-time checkpoints and wider permission/command/recovery behavior coverage. These are tracked in `CAWORKER_GAP_ANALYSIS.md`.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from rivet.agent import Agent
@@ -224,6 +225,32 @@ class AgentLifecycleTests(unittest.TestCase):
         self.assertEqual("unknown", unknown["execution_state"])
         self.assertEqual("SKIPPED", skipped["code"])
         self.assertEqual("not_executed", skipped["execution_state"])
+        agent.context.validate_active_tool_exchanges()
+
+    def test_registry_internal_error_stops_and_settles_later_calls(self) -> None:
+        agent = self.agent(
+            SequenceClient(ModelReply("", (tool_call("a"), tool_call("b", line=2))))
+        )
+        spec = agent.tools._tools["read_file"]
+        attempts = 0
+
+        def fail_handler(**_arguments):
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("synthetic handler failure")
+
+        agent.tools._tools["read_file"] = replace(spec, handler=fail_handler)
+
+        result = agent.run("inspect")
+
+        self.assertEqual("runtime_error", result.reason)
+        self.assertEqual(1, attempts)
+        messages = self.tool_messages(agent)
+        current = json.loads(messages[0]["content"])
+        pending = json.loads(messages[1]["content"])
+        self.assertEqual("unknown", current["status"])
+        self.assertEqual("INTERNAL_ERROR", current["code"])
+        self.assertEqual("skipped", pending["status"])
         agent.context.validate_active_tool_exchanges()
 
     def test_duplicate_model_tool_call_ids_fail_before_execution(self) -> None:
