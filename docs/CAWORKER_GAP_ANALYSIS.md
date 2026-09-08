@@ -34,20 +34,21 @@ The main execution path is concentrated in `Agent.run()` and `_run_turn()`. Mode
 - safe, ask and never approval modes.
 - Built-in, user and project Skill discovery and activation.
 - Streaming terminal output, cancellation and session commands.
+- Complete tool-call settlement for normal, skipped, cancelled and result-unknown operations.
+- Normalized `AgentResult` returns for model, protocol, compaction and tool-boundary failures.
+- Tool-exchange validation before restore, export and model requests.
+- Event callback failure isolation with diagnostic status records.
+- Offline Agent lifecycle and context protocol regression tests in CI.
 
 ## Partially Implemented Features
 
-### G01 — Early stops can leave incomplete tool exchanges
+### G01 — Tool-call settlement (completed in Phase 1-A)
 
-When repeated-call detection stops within a multi-call assistant response, later advertised calls can remain without tool results. A future request or restored session may therefore contain an invalid tool-call history.
+Every advertised tool call now receives exactly one observation before a turn returns. Calls that were never executed are marked `SKIPPED`; a boundary failure after execution may have begun is marked `RESULT_UNKNOWN` and is never replayed automatically. Duplicate call IDs and incomplete or orphaned exchanges are rejected before restore, export or another model request.
 
-Recommended change: centralize batch settlement. Every advertised call ID must receive exactly one real or explicitly skipped observation before state can be saved or sent again.
+### G02 — Core error and cancellation boundary (completed in Phase 1-A)
 
-### G02 — Core error and cancellation boundaries are inconsistent
-
-Model errors and failures during context compaction can escape `Agent.run()` without a normalized `AgentResult`. TUI persistence occurs after a returned result, so an escaped failure can also skip normal session saving. Event callback failures can interrupt bookkeeping.
-
-Recommended change: cover compaction, model request, tool execution, observation append and finalization with one turn lifecycle. Keep UI reporting failures separate from execution outcomes.
+Context compaction, model requests, tool dispatch, observation recording and finalization now share one turn boundary. Expected cancellation and runtime/model/protocol failures return a normalized `AgentResult`, allowing the TUI to save the settled conversation. Event callback failures are isolated and exposed through Agent status without changing execution outcomes.
 
 ### G03 — Loop Guard is narrow
 
@@ -91,9 +92,9 @@ Discovery and activation exist. Persistent enable/disable controls, explicit ref
 
 Recommended change: audit and extend the current registry only when needed; do not rewrite the Skill system.
 
-### G10 — Systematic behavior tests are missing
+### G10 — Systematic behavior tests are partial
 
-CI checks compilation, the CLI, package resources and context behavior, but there is no formal test suite for the Agent Loop, permissions, session failures, cancellation, command evidence and recovery.
+CI now runs offline Agent lifecycle and context protocol tests for normal multi-call execution, early settlement, cancellation, model errors, unknown tool outcomes, duplicate IDs, callback failures and restore/export validation. Permission matrices, process timeout/evidence and crash-recovery scenarios still need broader coverage.
 
 Recommended change: add standard-library fake-client tests with normal, failure and boundary cases from Phase 1 onward.
 
@@ -101,7 +102,6 @@ Recommended change: add standard-library fake-client tests with normal, failure 
 
 The following mechanisms are absent from the current single-Agent TUI Runtime:
 
-- Complete step lifecycle and reusable stop/finalization protocol.
 - Sliding-window/no-progress detection, total tool budget and turn deadline.
 - Explicit Plan Mode and approved-plan revision transition.
 - Stable Todo IDs and failed-state transition rules.
@@ -109,7 +109,7 @@ The following mechanisms are absent from the current single-Agent TUI Runtime:
 - Context budgeting that includes tool schemas and output reserve.
 - Unified ALLOW/ASK/DENY PolicyEngine.
 - Cross-session Memory Store.
-- Systematic offline behavior suite and coding-task benchmark.
+- Broader permission, command and recovery behavior coverage plus a coding-task benchmark.
 
 MCP, Plugin Marketplace, browser automation, multimodal input and remote execution remain optional future extensions.
 
@@ -117,9 +117,9 @@ MCP, Plugin Marketplace, browser automation, multimodal input and remote executi
 
 | Capability | Current state | Refactoring priority |
 | --- | --- | --- |
-| Agent Loop | Implemented; settlement/error boundaries incomplete | High / Phase 1 |
+| Agent Loop | Implemented; settlement and Core error boundary completed | High / Phase 1-C |
 | Tool System | Registry and validation implemented; outcome semantics incomplete | High / Phase 1 |
-| Error Recovery | Tool self-correction and HTTP retry exist; Core result handling inconsistent | High / Phase 1 |
+| Error Recovery | Tool self-correction, HTTP retry and normalized Core failures exist | High / Phase 1-B |
 | Loop Guard | Consecutive duplicate detection and max steps only | High / Phase 1 |
 | Plan / Todo | PlanState exists; no Plan Mode or stable task IDs | Medium / Phase 2 |
 | Permission | safe/ask/never and resource rules exist; no unified engine | High / Phase 2 |
@@ -136,13 +136,13 @@ MCP, Plugin Marketplace, browser automation, multimodal input and remote executi
 3. Session state contains overlapping conversation, archive, transcript, evidence and result representations; compatibility tests are required before schema changes.
 4. ModelClient formally declares only `complete`; streaming and cancellation are discovered dynamically.
 5. Returned output limits do not guarantee bounded memory use while reading files or collecting subprocess output.
-6. The package has no dedicated `tests/` suite, so behavior changes currently rely too much on manual simulations.
+6. The behavior suite covers the Phase 1-A lifecycle but permission, command and recovery coverage remains incomplete.
 
 ## Recommended Refactoring Order
 
 | Phase | Work | Acceptance focus |
 | --- | --- | --- |
-| Phase 1-A | Tool-call settlement and unified turn finalization | No orphan call IDs; failure/cancellation produces a result; TUI saves returned failures |
+| Phase 1-A (completed) | Tool-call settlement and unified turn finalization | No orphan call IDs; failure/cancellation produces a result; TUI saves returned failures |
 | Phase 1-B | ToolOutcome and error classification | Schema, execution, denial, timeout and process failure have clear semantics |
 | Phase 1-C | Loop Guard and execution budgets | Duplicate errors and cycles stop without false positives |
 | Phase 2 | Todo, Plan Mode and PolicyEngine | Approved plan revisions and a tested permission matrix |
@@ -153,13 +153,4 @@ MCP, Plugin Marketplace, browser automation, multimodal input and remote executi
 
 ## Next Task
 
-Start with Phase 1-A design. Read `Agent.run`, `_run_turn`, Context restore and the TUI save path. Define:
-
-- how pending tool calls are settled without executing skipped mutations;
-- how already-executed versus result-unknown operations are represented;
-- the exact step/total-step counting rule;
-- how event callback failures are isolated;
-- how legacy sessions with incomplete tool exchanges are rejected or repaired;
-- normal, failure and boundary fake-client tests.
-
-Keep the first implementation focused on `agent.py`, `context.py`, `cli.py` and tests. Do not combine it with Plan, Session storage replacement, Skill work or optional extensions.
+Proceed to Phase 1-B. Define a backward-compatible `ToolOutcome` and error taxonomy for successful execution, schema rejection, permission denial, cancellation, timeout, non-zero process exits and result-unknown boundaries. Preserve current observation fields while migrating consumers and extend the behavior suite around these outcome classes.

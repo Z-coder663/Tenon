@@ -44,6 +44,8 @@ The main Agent receives these tools:
 
 Every tool schema is sent to the model and enforced again locally. Unknown fields, missing required values, invalid types and out-of-range values are rejected before execution. Tool failures are returned as observations so the model can revise its approach.
 
+Each assistant tool-call batch is settled before a turn returns. Executed calls receive their real observation, calls deliberately left unexecuted receive `SKIPPED`, and a dispatch-boundary failure that cannot prove whether a side effect occurred receives `RESULT_UNKNOWN`. Result-unknown calls are not replayed automatically. Context validation rejects duplicate IDs, orphan results and incomplete exchanges before state export, restore or another model request.
+
 Mutating tools follow `safe`, `ask`, or `never` approval mode. Workspace paths are resolved before use and must remain inside the selected root. Commands run with a timeout, cancellation support, a dangerous-command blocklist and bounded returned output.
 
 ## Completion evidence
@@ -74,6 +76,8 @@ Restore validates the workspace fingerprint and saved structures. External chang
 
 `OpenAICompatibleClient` reconstructs streamed text, tool calls and configured replay fields from SSE. The Agent appends an assistant message after a complete model reply. `Ctrl+C` requests cooperative cancellation of model or command execution and returns control to the TUI without exiting the whole session.
 
+Compaction, model, protocol and unexpected tool-boundary failures return a normalized `AgentResult` after settling any pending calls. TUI event callbacks run outside the execution bookkeeping boundary; callback failures are retained in Agent status for diagnosis and do not corrupt the conversation.
+
 ## Known reliability limits
 
-The current Runtime still needs stronger tool-call settlement on early stops, a unified Core error boundary, broader loop/no-progress detection, a hard request budget, execution-time checkpoints and systematic behavior tests. These are tracked in `CAWORKER_GAP_ANALYSIS.md`.
+The current Runtime still needs uniform typed tool outcomes, broader loop/no-progress detection, a hard request budget, execution-time checkpoints and wider permission/command/recovery behavior coverage. These are tracked in `CAWORKER_GAP_ANALYSIS.md`.

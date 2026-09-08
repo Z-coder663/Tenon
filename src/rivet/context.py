@@ -89,6 +89,7 @@ class ContextManager:
         restored: list[Message] = []
         for index, message in enumerate(conversation):
             restored.append(cls._validated_saved_message(message, index + 1))
+        cls.validate_tool_exchanges(restored, source="saved conversation")
 
         first_regular = next(
             (
@@ -124,10 +125,14 @@ class ContextManager:
 
     def export_conversation(self) -> list[Message]:
         """Exclude the system prompt because it contains the local workspace path."""
-        return copy.deepcopy(self.messages[1:])
+        conversation = self.messages[1:]
+        self.validate_tool_exchanges(conversation, source="active conversation")
+        return copy.deepcopy(conversation)
 
     def export_state(self) -> JsonObject:
         """Persist compressed raw history inside the existing session payload."""
+        for index, unit in enumerate(self.archived_units, start=1):
+            self.validate_tool_exchanges(unit, source=f"archived unit {index}")
         return {
             "version": 1,
             "recent_units": self.recent_units,
@@ -137,6 +142,75 @@ class ContextManager:
 
     def append(self, message: Message) -> None:
         self.messages.append(message)
+
+    def validate_active_tool_exchanges(self) -> None:
+        """Reject an incomplete tool exchange before it reaches the model."""
+        self.validate_tool_exchanges(self.messages, source="active context")
+
+    @classmethod
+    def validate_tool_exchanges(
+        cls, messages: list[Message], *, source: str = "conversation"
+    ) -> None:
+        """Require each assistant tool call to have one contiguous matching result."""
+        pending: set[str] | None = None
+        for index, message in enumerate(messages, start=1):
+            role = message.get("role")
+            if pending is not None and role != "tool":
+                missing = ", ".join(sorted(pending))
+                raise SessionError(
+                    f"{source} message {index} appears before tool result(s): {missing}"
+                )
+
+            if role == "assistant":
+                raw_calls = message.get("tool_calls")
+                if not raw_calls:
+                    continue
+                if not isinstance(raw_calls, list):
+                    raise SessionError(
+                        f"{source} assistant message {index} has invalid tool calls"
+                    )
+                call_ids: list[str] = []
+                for call in raw_calls:
+                    if not isinstance(call, dict):
+                        raise SessionError(
+                            f"{source} assistant message {index} has an invalid tool call"
+                        )
+                    call_id = call.get("id")
+                    function = call.get("function")
+                    if (
+                        not isinstance(call_id, str)
+                        or not call_id
+                        or not isinstance(function, dict)
+                        or not isinstance(function.get("name"), str)
+                        or not function.get("name")
+                        or not isinstance(function.get("arguments"), str)
+                    ):
+                        raise SessionError(
+                            f"{source} assistant message {index} has an invalid tool call"
+                        )
+                    call_ids.append(call_id)
+                if len(set(call_ids)) != len(call_ids):
+                    raise SessionError(
+                        f"{source} assistant message {index} has duplicate tool call IDs"
+                    )
+                pending = set(call_ids)
+                continue
+
+            if role == "tool":
+                call_id = message.get("tool_call_id")
+                if pending is None:
+                    raise SessionError(f"{source} message {index} is an orphan tool result")
+                if not isinstance(call_id, str) or call_id not in pending:
+                    raise SessionError(
+                        f"{source} message {index} has an unexpected or duplicate tool result"
+                    )
+                pending.remove(call_id)
+                if not pending:
+                    pending = None
+
+        if pending is not None:
+            missing = ", ".join(sorted(pending))
+            raise SessionError(f"{source} is missing tool result(s): {missing}")
 
     @property
     def size_chars(self) -> int:
@@ -318,6 +392,9 @@ class ContextManager:
                         "saved archived history contains a system message"
                     )
                 unit.append(validated)
+            self.validate_tool_exchanges(
+                unit, source=f"saved archived unit {len(restored_units) + 1}"
+            )
             restored_units.append(unit)
         self.archived_units = restored_units
         self.compaction_count = compaction_count

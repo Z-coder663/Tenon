@@ -67,6 +67,9 @@ jobs:
           if missing:
               raise SystemExit(f"Missing installed resources: {missing}")
 
+      - name: Run behavior tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
   context-smoke:
     name: Context compression regression
     runs-on: ubuntu-latest

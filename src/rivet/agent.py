@@ -9,7 +9,7 @@ from typing import Any
 
 from .config import Config
 from .context import ContextManager, STRUCTURED_SUMMARY_INSTRUCTIONS
-from .errors import OperationCancelled, SessionError
+from .errors import ModelError, OperationCancelled, SessionError
 from .plan import PlanState
 from .prompt import system_prompt
 from .skills import SkillRegistry
@@ -210,7 +210,9 @@ class Agent:
     ) -> None:
         self.config = config
         self.client = client
-        self.events = event_handler or (lambda _event, _data: None)
+        self._event_handler = event_handler or (lambda _event, _data: None)
+        self._event_failures: list[JsonObject] = []
+        self.events = self._emit_event
         self.approver = approver
         self._cancel_event = cancel_event or threading.Event()
         self._owns_cancel_event = cancel_event is None
@@ -227,6 +229,7 @@ class Agent:
 
     def reset(self) -> None:
         """Start a new conversation and a new in-memory workspace diff baseline."""
+        self._event_failures.clear()
         if self.skills is not None:
             self.skills.reset_session()
             self._system_prompt = system_prompt(
@@ -270,6 +273,7 @@ class Agent:
             "context_chars": self.context.size_chars if self.context is not None else 0,
             "context_history": context_status,
             "approval_mode": self.config.approval_mode,
+            "event_failures": copy.deepcopy(self._event_failures),
             "recovery": self.recovery_snapshot(),
             "operations": self.tools.workspace.operation_history(),
             "plan": self.plan.snapshot(),
@@ -509,6 +513,7 @@ class Agent:
             if callable(reset_cancel):
                 reset_cancel()
             self._running = True
+            self._active_step = 0
             if self.skills is not None:
                 self.skills.begin_turn(self.turns + 1)
         try:
@@ -516,6 +521,39 @@ class Agent:
                 self.tools.workspace.begin_turn_operation(self.turns + 1, task)
                 checkpoint_started = True
             return self._run_turn(task)
+        except (KeyboardInterrupt, OperationCancelled):
+            if self.context is not None and self.turns > 0:
+                self._settle_unresolved_tool_calls(
+                    self.context,
+                    code="RESULT_UNKNOWN",
+                    detail="result is unknown because the turn was cancelled unexpectedly",
+                )
+                return self._cancelled_result(
+                    self.context,
+                    self.state,
+                    max(1, self._active_step),
+                    self.turns,
+                    "turn finalization",
+                )
+            raise
+        except Exception as exc:
+            if self.context is not None and self.turns > 0:
+                self._settle_unresolved_tool_calls(
+                    self.context,
+                    code="RESULT_UNKNOWN",
+                    detail="result is unknown because the turn stopped unexpectedly",
+                )
+                reason = "model_error" if isinstance(exc, ModelError) else "runtime_error"
+                return self._runtime_failure_result(
+                    self.context,
+                    self.state,
+                    max(1, self._active_step),
+                    self.turns,
+                    exc,
+                    reason=reason,
+                    phase="turn execution",
+                )
+            raise
         finally:
             if checkpoint_started:
                 try:
@@ -527,6 +565,7 @@ class Agent:
                     )
             with self._run_state_lock:
                 self._running = False
+                self._active_step = 0
 
     def request_cancel(self) -> bool:
         """Request cooperative cancellation of the active model or tool operation."""
@@ -596,24 +635,47 @@ class Agent:
         plan_completion_reprompts = 0
 
         for step in range(1, self.config.max_steps + 1):
-            compacted = context.compact()
-            if compacted:
-                self.events(
-                    "context_compacted",
-                    {
-                        "messages": len(context.messages),
-                        "turn": turn,
-                        **context.last_compaction,
-                    },
-                )
-            self.events("model_start", {"step": step, "turn": turn})
+            self._active_step = step
             try:
                 self._raise_if_cancelled()
+                compacted = context.compact()
+                if compacted:
+                    self.events(
+                        "context_compacted",
+                        {
+                            "messages": len(context.messages),
+                            "turn": turn,
+                            **context.last_compaction,
+                        },
+                    )
+                context.validate_active_tool_exchanges()
+                self.events("model_start", {"step": step, "turn": turn})
                 reply, streamed = self._complete_model(context.messages, step, turn)
                 self._raise_if_cancelled()
+                self._validate_reply_tool_calls(reply.tool_calls)
             except (KeyboardInterrupt, OperationCancelled):
                 return self._cancelled_result(
                     context, state, step, turn, "model request"
+                )
+            except ModelError as exc:
+                return self._runtime_failure_result(
+                    context,
+                    state,
+                    step,
+                    turn,
+                    exc,
+                    reason="model_error",
+                    phase="model request",
+                )
+            except SessionError as exc:
+                return self._runtime_failure_result(
+                    context,
+                    state,
+                    step,
+                    turn,
+                    exc,
+                    reason="protocol_error",
+                    phase="context validation",
                 )
             assistant_message = self._assistant_message(
                 reply.content, reply.tool_calls, reply.extensions
@@ -650,36 +712,48 @@ class Agent:
                         result = self.tools.execute(call.name, call.arguments)
                     except (KeyboardInterrupt, OperationCancelled):
                         result = self._cancelled_tool_payload(call.name)
-                    state.record_tool_result(call.name, result)
-                    context.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "name": call.name,
-                            "content": result,
-                        }
-                    )
-                    self.events(
-                        "tool_end",
-                        {
-                            "step": step,
-                            "turn": turn,
-                            "name": call.name,
-                            "result": result,
-                        },
+                    except Exception as exc:
+                        result = self._unknown_tool_payload(call.name, exc)
+                        self._append_tool_observation(
+                            context,
+                            state,
+                            call,
+                            result,
+                            step=step,
+                            turn=turn,
+                            record_state=False,
+                        )
+                        self._settle_tool_calls(
+                            context,
+                            reply.tool_calls[call_index + 1 :],
+                            code="SKIPPED",
+                            detail="skipped after an earlier tool returned an unknown result",
+                        )
+                        return self._runtime_failure_result(
+                            context,
+                            state,
+                            step,
+                            turn,
+                            exc,
+                            reason="runtime_error",
+                            phase=f"tool {call.name}",
+                        )
+                    self._append_tool_observation(
+                        context,
+                        state,
+                        call,
+                        result,
+                        step=step,
+                        turn=turn,
                     )
                     if self._tool_was_cancelled(result) or self._cancel_event.is_set():
-                        for pending in reply.tool_calls[call_index + 1 :]:
-                            context.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": pending.id,
-                                    "name": pending.name,
-                                    "content": self._cancelled_tool_payload(
-                                        pending.name, skipped=True
-                                    ),
-                                }
-                            )
+                        self._settle_tool_calls(
+                            context,
+                            reply.tool_calls[call_index + 1 :],
+                            code="CANCELLED",
+                            detail="skipped after another tool was cancelled",
+                            cancelled=True,
+                        )
                         return self._cancelled_result(
                             context, state, step, turn, f"tool {call.name}"
                         )
@@ -690,6 +764,12 @@ class Agent:
                         previous_observation = observation
                         repeat_count = 1
                     if repeat_count >= 3:
+                        self._settle_tool_calls(
+                            context,
+                            reply.tool_calls[call_index + 1 :],
+                            code="SKIPPED",
+                            detail="skipped because repeated-call protection stopped the turn",
+                        )
                         final = (
                             "Stopped after the same tool call produced the same result "
                             f"three times: {call.name}."
@@ -943,6 +1023,175 @@ class Agent:
             )
         return reply, stream_started
 
+    def _emit_event(self, event: str, data: JsonObject) -> None:
+        """Keep presentation failures from corrupting the Agent lifecycle."""
+        try:
+            self._event_handler(event, data)
+        except Exception as exc:
+            self._event_failures.append(
+                {
+                    "event": event,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:500],
+                }
+            )
+            self._event_failures = self._event_failures[-20:]
+
+    @staticmethod
+    def _validate_reply_tool_calls(calls: tuple[ToolCall, ...]) -> None:
+        call_ids = [call.id for call in calls]
+        if any(not call_id for call_id in call_ids):
+            raise ModelError("assistant tool call is missing an ID")
+        if len(set(call_ids)) != len(call_ids):
+            raise ModelError("assistant tool call IDs must be unique within one response")
+
+    def _append_tool_observation(
+        self,
+        context: ContextManager,
+        state: TaskState,
+        call: ToolCall,
+        result: str,
+        *,
+        step: int,
+        turn: int,
+        record_state: bool = True,
+    ) -> None:
+        context.append(
+            {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "name": call.name,
+                "content": result,
+            }
+        )
+        if record_state:
+            state.record_tool_result(call.name, result)
+        self.events(
+            "tool_end",
+            {
+                "step": step,
+                "turn": turn,
+                "name": call.name,
+                "result": result,
+            },
+        )
+
+    def _settle_tool_calls(
+        self,
+        context: ContextManager,
+        calls: tuple[ToolCall, ...],
+        *,
+        code: str,
+        detail: str,
+        cancelled: bool = False,
+        result_unknown: bool = False,
+    ) -> None:
+        for call in calls:
+            result = self._settled_tool_payload(
+                call.name,
+                code=code,
+                detail=detail,
+                cancelled=cancelled,
+                result_unknown=result_unknown,
+            )
+            context.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": call.name,
+                    "content": result,
+                }
+            )
+            self.events(
+                "tool_skipped",
+                {"name": call.name, "tool_call_id": call.id, "result": result},
+            )
+
+    def _settle_unresolved_tool_calls(
+        self, context: ContextManager, *, code: str, detail: str
+    ) -> None:
+        messages = context.messages
+        assistant_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index].get("role") == "assistant"
+                and messages[index].get("tool_calls")
+            ),
+            None,
+        )
+        if assistant_index is None:
+            return
+        suffix = messages[assistant_index + 1 :]
+        if any(message.get("role") != "tool" for message in suffix):
+            return
+        observed = {
+            message.get("tool_call_id")
+            for message in suffix
+            if isinstance(message.get("tool_call_id"), str)
+        }
+        unresolved: list[ToolCall] = []
+        for raw_call in messages[assistant_index].get("tool_calls", []):
+            if not isinstance(raw_call, dict):
+                continue
+            call_id = raw_call.get("id")
+            function = raw_call.get("function")
+            if (
+                not isinstance(call_id, str)
+                or call_id in observed
+                or not isinstance(function, dict)
+            ):
+                continue
+            name = function.get("name")
+            arguments = function.get("arguments")
+            if isinstance(name, str) and isinstance(arguments, str):
+                unresolved.append(ToolCall(call_id, name, arguments))
+        self._settle_tool_calls(
+            context,
+            tuple(unresolved),
+            code=code,
+            detail=detail,
+            result_unknown=code == "RESULT_UNKNOWN",
+        )
+
+    def _runtime_failure_result(
+        self,
+        context: ContextManager,
+        state: TaskState,
+        step: int,
+        turn: int,
+        exc: Exception,
+        *,
+        reason: str,
+        phase: str,
+    ) -> AgentResult:
+        if reason == "model_error":
+            final = f"Model request failed: {exc}"
+        elif reason == "protocol_error":
+            final = f"Conversation protocol validation failed: {exc}"
+        else:
+            final = f"Task stopped because of a runtime error: {type(exc).__name__}: {exc}"
+        context.append({"role": "assistant", "content": final})
+        self.events(
+            "stopped",
+            {
+                "reason": reason,
+                "phase": phase,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "step": step,
+                "turn": turn,
+            },
+        )
+        return self._finish(
+            False,
+            final,
+            step,
+            reason,
+            tuple(context.messages),
+            self._result_state(state),
+        )
+
     def _raise_if_cancelled(self) -> None:
         if self._cancel_event.is_set():
             raise OperationCancelled("operation cancelled by user")
@@ -1097,22 +1346,60 @@ class Agent:
         return restored
 
     @staticmethod
-    def _cancelled_tool_payload(name: str, *, skipped: bool = False) -> str:
-        detail = (
-            "skipped after another tool was cancelled"
-            if skipped
-            else "cancelled by user"
-        )
+    def _cancelled_tool_payload(name: str) -> str:
         return json.dumps(
             {
                 "ok": False,
                 "cancelled": True,
-                "error": f"{name} {detail}",
+                "result_unknown": True,
+                "execution_state": "unknown",
+                "error": f"{name} was cancelled; its execution result is unknown",
                 "code": "CANCELLED",
-                "retryable": True,
+                "retryable": False,
             },
             ensure_ascii=False,
         )
+
+    @staticmethod
+    def _unknown_tool_payload(name: str, exc: Exception) -> str:
+        return json.dumps(
+            {
+                "ok": False,
+                "result_unknown": True,
+                "execution_state": "unknown",
+                "error": (
+                    f"{name} stopped without a confirmed result: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "code": "RESULT_UNKNOWN",
+                "retryable": False,
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _settled_tool_payload(
+        name: str,
+        *,
+        code: str,
+        detail: str,
+        cancelled: bool = False,
+        result_unknown: bool = False,
+    ) -> str:
+        payload: JsonObject = {
+            "ok": False,
+            "execution_state": "unknown" if result_unknown else "not_executed",
+            "error": f"{name} {detail}",
+            "code": code,
+            "retryable": False,
+        }
+        if result_unknown:
+            payload["result_unknown"] = True
+        else:
+            payload["skipped"] = True
+        if cancelled:
+            payload["cancelled"] = True
+        return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
     def _tool_was_cancelled(result: str) -> bool:
